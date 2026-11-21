@@ -1,159 +1,18 @@
-// Boot and the one loop: input is read every frame, the world advances in
-// fixed 1/60 s steps (several in a slow frame, none in a fast one), and the
-// renderer paints what is there. The game moves between five screens: title,
-// play, paused, caught and win.
-//
-// ?seed=N fixes the run. ?shot=start|play|alarm|escape (with &seed=N) stages
-// that scene instead of running the loop, paints it twice and sets
-// window.__shotReady for a screenshot.
-
-import { BEST_KEY, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_GAME_OVER, EVENT_LEVEL_CLEAR, EVENT_WIN } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, ACTION_THROW, createInput } from './input.js';
-import { createAudio } from './audio.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
-import { stageShot } from './shots.js';
-
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
-
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
-
-const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const audio = createAudio();
-const world = createWorld(createRandom(seed), audio);
-const renderer = createRenderer(canvas);
-
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
-}
-
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best time then lasts this visit only.
-  }
-}
-
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best, { x: 0, y: 0, inside: false });
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
-
-  // Screen readers (and anyone watching the page's text) hear the screen changes.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    audio.unlock();
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing ${world.state.level.name}. Lift three relics, then reach the east door.`);
-  }
-
-  function endGame(won) {
-    if (won) {
-      screen = SCREEN_WIN;
-      if (world.state.spotted === 0 && (best === 0 || world.state.totalTimeMs < best)) {
-        best = Math.round(world.state.totalTimeMs);
-        saveBest(best);
-      }
-      announce('All three galleries cleared.');
-    } else {
-      screen = SCREEN_OVER;
-      announce('Caught out. Press Space to try again.');
-    }
-  }
-
-  function step(flags) {
-    if (screen === SCREEN_TITLE) {
-      // The gallery idles behind the title: guards walk their rounds.
-      world.step(STEP, { x: 0, y: 0 }, false, { throw: false }, null);
-      return;
-    }
-    const throwTarget = flags & ACTION_THROW ? input.takeThrowTarget() : null;
-    const events = world.step(STEP, input.direction(), input.sneaking(), { throw: Boolean(flags & ACTION_THROW) }, throwTarget);
-    if (events & EVENT_WIN) endGame(true);
-    else if (events & EVENT_GAME_OVER) endGame(false);
-    else if (events & EVENT_LEVEL_CLEAR) {
-      announce(`Gallery cleared. Now ${world.state.level.name}.`);
-    }
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    // One-shot presses are taken once per frame and handed to the steps, so
-    // a throw queued between two frames is never lost and never counted twice.
-    const flags = input.takeActions();
-    if (flags & ACTION_CONFIRM) {
-      if (screen === SCREEN_TITLE || screen === SCREEN_OVER || screen === SCREEN_WIN) startGame();
-      else if (screen === SCREEN_PAUSED) {
-        screen = SCREEN_PLAY;
-        announce('Playing.');
-      }
-    } else if (flags & ACTION_PAUSE) {
-      if (screen === SCREEN_PLAY) {
-        screen = SCREEN_PAUSED;
-        announce('Paused.');
-      } else if (screen === SCREEN_PAUSED) {
-        screen = SCREEN_PLAY;
-        announce('Playing.');
-      }
-    }
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      // A throw is a one-shot press: only the first catch-up step of the
-      // frame may spend it, or one key press would throw several pebbles.
-      let first = true;
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step(first ? flags : 0);
-        first = false;
-        accumulator -= STEP;
-      }
-    } else {
-      accumulator = 0;
-    }
-    renderer.draw(world.state, screen, best, input.mouse());
-  }
-
-  // Leaving the tab pauses a running game rather than letting guards close in unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('The Quiet Gallery. Press Space or click to start.');
-  requestAnimationFrame(frame);
-}
-
-if (shot) runShot(shot);
-else runGame();
+import {levels} from './levels.js';
+import {makeWorld,center,blocked} from './world.js';
+import {makeGuards,updateGuards,noise,sees} from './guards.js';
+import {updatePlayer} from './physics.js';
+import {createInput} from './input.js';
+import {createAudio} from './audio.js';
+import {draw} from './render.js';
+import {setupShot} from './shots.js';
+import {mulberry32} from './random.js';
+const canvas=document.querySelector('canvas'),ctx=canvas.getContext('2d'),input=createInput(canvas),params=new URLSearchParams(location.search),rng=mulberry32(Number(params.get('seed'))||1);
+const game={audio:createAudio(),state:'start',index:0,total:0,ghosts:0,autoplay:params.get('autoplay')==='1'};
+function load(index){const level=levels[index];game.index=index;game.world=makeWorld(level);game.player={...center(level.start),angle:0,sneak:false};game.guards=makeGuards(level);game.relics=level.relics.map(p=>({...center(p),collected:false}));game.exit=center(level.exit);game.pebbles=3;game.attempts=3;game.time=0;game.spotted=false;game.path=[];game.pathGoal='';}
+function respawn(){game.player={...center(levels[game.index].start),angle:0};game.guards=makeGuards(levels[game.index]);game.path=[];game.state='playing'}
+function route(target){const start=[Math.floor(game.player.x/40),Math.floor(game.player.y/40)],end=[Math.floor(target.x/40),Math.floor(target.y/40)],queue=[start],prev=new Map([[start.join(','),null]]);for(let i=0;i<queue.length;i++){const p=queue[i];if(p[0]===end[0]&&p[1]===end[1])break;for(const [dx,dy] of [[1,0],[0,1],[0,-1],[-1,0]]){const n=[p[0]+dx,p[1]+dy],key=n.join(',');if(!prev.has(key)&&!blocked(game.world,n[0]*40+20,n[1]*40+20)){prev.set(key,p);queue.push(n)}}}let p=end,path=[];if(!prev.has(p.join(',')))return [];while(p&&p.join(',')!==start.join(',')){path.unshift(center(p));p=prev.get(p.join(','))}return path}
+function autoVector(){const target=game.relics.find(r=>!r.collected)||game.exit,key=`${target.x},${target.y}`;if(game.pathGoal!==key||!game.path.length){game.path=route(target);game.pathGoal=key}let next=game.path[0]||target;if(Math.hypot(next.x-game.player.x,next.y-game.player.y)<4){game.path.shift();next=game.path[0]||target}if(game.guards.some(g=>sees(game.world,g,next)))return {x:0,y:0};return {x:next.x-game.player.x,y:next.y-game.player.y}}
+load(0);if(params.has('shot'))setupShot(game,params.get('shot'));else if(game.autoplay)game.state='playing';
+let last=performance.now();function frame(now){const dt=Math.min((now-last)/1000,.05);last=now;const click=input.takeClick(),press=input.pressed,keys=input.keys,confirm=press.has('Enter')||!!click;if(!game.shot){if(game.state==='start'&&confirm)game.state='playing';else if(game.state==='paused'&&(press.has('KeyP')||press.has('Escape')))game.state='playing';else if(game.state==='playing'&&(press.has('KeyP')||press.has('Escape')))game.state='paused';else if(game.state==='levelComplete'&&(confirm||game.autoplay)){if(game.index===2){game.state='gameComplete';if(game.autoplay)console.log('AUTOPLAY ALL LEVELS COMPLETE')}else{load(game.index+1);game.state='playing'}}else if(game.state==='gameComplete'&&confirm){game.total=0;game.ghosts=0;load(0);game.state='playing'}
+if(game.state==='caught'){game.caughtTimer-=dt;if(game.caughtTimer<=0){if(game.attempts<=0){load(game.index)}respawn()}}else if(game.state==='playing'){game.time+=dt;const vector=game.autoplay?autoVector():{x:(keys.has('KeyD')||keys.has('ArrowRight')?1:0)-(keys.has('KeyA')||keys.has('ArrowLeft')?1:0),y:(keys.has('KeyS')||keys.has('ArrowDown')?1:0)-(keys.has('KeyW')||keys.has('ArrowUp')?1:0)};if((press.has('KeyQ')||click)&&game.pebbles>0){const p=game.player;let a=click?Math.atan2(click.y-p.y,click.x-p.x):p.angle;const distance=click?Math.min(180,Math.hypot(click.x-p.x,click.y-p.y)):150;let dest={x:p.x,y:p.y};for(let d=5;d<=distance;d+=5){const x=p.x+Math.cos(a)*d,y=p.y+Math.sin(a)*d;if(blocked(game.world,x,y))break;dest={x,y}}game.pebbles--;noise(game,dest);game.audio.pebble()}if(updatePlayer(game,dt,vector,game.autoplay||keys.has('ShiftLeft')||keys.has('ShiftRight'))){game.total+=game.time;if(!game.spotted)game.ghosts++;game.audio.complete();game.state='levelComplete';if(game.autoplay)console.log(`AUTOPLAY level ${game.index+1} complete ${game.spotted?'spotted':'ghost'}`)}else if(updateGuards(game,dt)){game.attempts--;game.audio.caught();game.state='caught';game.caughtTimer=1.2}}}draw(ctx,game);input.end();requestAnimationFrame(frame)}requestAnimationFrame(frame);
